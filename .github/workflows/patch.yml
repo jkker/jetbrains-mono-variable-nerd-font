@@ -1,0 +1,157 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *' # Daily check for new upstream releases
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Resolve build version from releases
+        id: version
+        run: |
+          set -euo pipefail
+          upstream_tag=$(gh api repos/JetBrains/JetBrainsMono/releases/latest --jq '.tag_name')
+          upstream_version=${upstream_tag#v}
+          latest_repo_tag=$(gh release list --limit 1 --json tagName,isLatest --jq 'map(select(.isLatest == true))[0].tagName // ""')
+          latest_repo_version=${latest_repo_tag#v}
+
+          echo "Upstream version: $upstream_version"
+          echo "Current repo release: ${latest_repo_version:-none}"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Manual trigger detected. Forcing rebuild/re-release for $upstream_version"
+            echo "VERSION=$upstream_version" >> "$GITHUB_OUTPUT"
+            echo "SHOULD_BUILD=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$upstream_version" != "$latest_repo_version" ]]; then
+            echo "New upstream version available: $upstream_version"
+            echo "VERSION=$upstream_version" >> "$GITHUB_OUTPUT"
+            echo "SHOULD_BUILD=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No new version available"
+            echo "VERSION=$upstream_version" >> "$GITHUB_OUTPUT"
+            echo "SHOULD_BUILD=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Exit if no new version
+        if: ${{ steps.version.outputs.SHOULD_BUILD == 'false' }}
+        run: |
+          echo "No new upstream version. Exiting."
+          exit 0
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fontforge python3-fontforge
+          python3 -m pip install --user fonttools
+
+      - name: Download upstream fonts
+        run: |
+          set -euo pipefail
+          rm -rf build-work patched-fonts
+          mkdir -p build-work patched-fonts
+          curl -g -fsSLo "build-work/JetBrainsMono[wght].ttf" "https://raw.githubusercontent.com/JetBrains/JetBrainsMono/master/fonts/variable/JetBrainsMono[wght].ttf"
+          curl -g -fsSLo "build-work/JetBrainsMono-Italic[wght].ttf" "https://raw.githubusercontent.com/JetBrains/JetBrainsMono/master/fonts/variable/JetBrainsMono-Italic[wght].ttf"
+
+      - name: Setup Nerd Fonts patcher
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/ryanoasis/nerd-fonts.git build-work/nerd-fonts
+          cd build-work/nerd-fonts
+          git sparse-checkout set --no-cone font-patcher src/glyphs bin
+
+      - name: Convert variable fonts to static
+        run: |
+          set -euo pipefail
+          python3 << 'PYTHON'
+          import os
+          from pathlib import Path
+          from fontTools.ttLib import TTFont
+          from fontTools.varLib.instancer import instantiateVariableFont
+
+          work_dir = Path("build-work")
+          mapping = [
+              ("JetBrainsMono[wght].ttf", "JetBrainsMono-Regular.ttf"),
+              ("JetBrainsMono-Italic[wght].ttf", "JetBrainsMono-Italic.ttf"),
+          ]
+
+          for src, dst in mapping:
+              src_path = work_dir / src
+              dst_path = work_dir / dst
+              font = TTFont(src_path)
+              try:
+                  axes_defaults = {axis.axisTag: axis.defaultValue for axis in font["fvar"].axes}
+                  default_wght = axes_defaults.get("wght", 400)
+                  instantiated = instantiateVariableFont(font, {"wght": default_wght})
+                  instantiated.save(dst_path)
+                  instantiated.close()
+              finally:
+                  font.close()
+          PYTHON
+
+      - name: Patch fonts (progressbar hidden)
+        run: |
+          set -euo pipefail
+          for font in JetBrainsMono-Regular.ttf JetBrainsMono-Italic.ttf; do
+            echo "Patching $font..."
+            log_file="build-work/${font%.ttf}.log"
+            fontforge -script build-work/nerd-fonts/font-patcher \
+              -c \
+              --careful \
+              --no-progressbars \
+              --out patched-fonts \
+              "build-work/$font" > "$log_file" 2>&1
+            grep -Ev "^\[|Progress|Adding|Generated" "$log_file" || true
+          done
+
+      - name: Create release notes
+        run: |
+          set -euo pipefail
+          cat > build-work/release-notes.md << EOF
+          # JetBrains Mono Nerd Font v${{ steps.version.outputs.VERSION }}
+
+          This release contains JetBrains Mono v${{ steps.version.outputs.VERSION }} patched with Nerd Fonts glyphs.
+
+          ## Fonts Included
+
+          - **JetBrainsMonoNerdFont-Regular.ttf** - Regular weight with Nerd Font glyphs
+          - **JetBrainsMonoNerdFont-Italic.ttf** - Italic weight with Nerd Font glyphs
+
+          ## Upstream
+
+          - [JetBrains Mono v${{ steps.version.outputs.VERSION }}](https://github.com/JetBrains/JetBrainsMono/releases/tag/v${{ steps.version.outputs.VERSION }})
+          - [Nerd Fonts](https://github.com/ryanoasis/nerd-fonts)
+
+          ## Installation
+
+          Download the font files and install them on your system:
+
+          - **macOS**: Double-click the font file and click "Install Font"
+          - **Linux**: Copy to \`~/.local/share/fonts/\` or \`/usr/share/fonts/\`
+          - **Windows**: Right-click the font file and select "Install"
+          EOF
+
+      - name: Create or update GitHub release
+        run: |
+          set -euo pipefail
+          tag="v${{ steps.version.outputs.VERSION }}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$tag" --notes-file build-work/release-notes.md
+          else
+            gh release create "$tag" --title "$tag" --notes-file build-work/release-notes.md
+          fi
+
+          gh release upload "$tag" patched-fonts/*.ttf --clobber
